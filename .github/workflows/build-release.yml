@@ -1,0 +1,224 @@
+name: Build and Release DMG
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g., 1.0.0)'
+        required: true
+        default: '1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    # Apple-Silicon only as of v0.4.0. macOS 26 (Tahoe) drops Intel and
+    # our headline transcription engine (Parakeet TDT v3 via MLX) is
+    # Apple-Silicon only, so the Intel build was shipping a degraded
+    # product anyway. Intel users stay on v0.3.8 — auto-update is gated
+    # via `electron-builder.mac.notarize.teamId` + the `arm64`-only
+    # latest-mac.yml below, so Intel installs of v0.3.8 won't even see
+    # this release.
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            build_cmd: build:arm64
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: 'npm'
+        cache-dependency-path: app/package-lock.json
+
+    - name: Get version from package.json
+      id: package_version
+      working-directory: app
+      run: echo "version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    - name: Download bundled binaries (Ollama, ffmpeg)
+      run: |
+        chmod +x scripts/download-ollama.sh
+        ./scripts/download-ollama.sh
+
+    - name: Build mic-monitor helper (Swift)
+      run: |
+        chmod +x scripts/build-mic-monitor.sh
+        ./scripts/build-mic-monitor.sh arm64
+        file bin/mic-monitor
+        # Fail loudly if the binary isn't arm64 — silent mismatches would
+        # ship users a Rosetta'd helper.
+        file bin/mic-monitor | grep -q "arm64"
+
+    - name: Build Python backend with PyInstaller
+      run: |
+        pyinstaller stenoai.spec --noconfirm
+        # Verify build and architecture
+        ls -la dist/stenoai/
+        file dist/stenoai/stenoai
+        echo "Expected arch: ${{ matrix.arch }}"
+        echo "Backend built successfully"
+
+    - name: Install Electron dependencies
+      working-directory: app
+      run: npm ci
+
+    - name: Import code signing certificate
+      uses: apple-actions/import-codesign-certs@v2
+      with:
+        p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+        p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+    - name: Build and notarize DMG for ${{ matrix.arch }}
+      working-directory: app
+      # --publish=never is critical: electron-builder has a `publish` config
+      # (github provider) and GH_TOKEN in env, so without this it auto-creates
+      # a DRAFT GitHub release for the tag and uploads the DMG there. That draft
+      # is redundant — the real release is created by the `release` job below
+      # (softprops/action-gh-release) from the CI artifacts — and worse, the
+      # Windows job (build-windows.yml) would race and upload its .exe onto that
+      # stray draft instead of the published release, 404'ing the website link.
+      run: npm run ${{ matrix.build_cmd }} -- --publish=never
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        APPLE_ID: ${{ secrets.APPLE_ID }}
+        APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-${{ matrix.arch }}
+        path: |
+          app/dist/*.dmg
+          app/dist/*.zip
+          app/dist/*.yml
+          app/dist/*.yaml
+        retention-days: 1
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build-macos
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        fetch-tags: true
+
+    - name: Get version from package.json
+      id: package_version
+      working-directory: app
+      run: echo "version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+
+    - name: Extract annotated tag message
+      id: tag_body
+      if: startsWith(github.ref, 'refs/tags/v')
+      run: |
+        # actions/checkout@v4 with fetch-tags: true sometimes leaves the
+        # annotated tag as a lightweight pointer (just the commit OID,
+        # no annotation object), which makes `for-each-ref --format=
+        # '%(contents:body)'` return empty. The action-gh-release step
+        # below then falls back to the commit subject in the release
+        # body — that's how every prior release ended up with
+        # "chore(release): prep vX.Y.Z" as its body instead of the
+        # actual notes we wrote on the tag. Refetch the tag explicitly
+        # so the annotation object is present locally before we read it.
+        git fetch --force origin "refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}"
+        # Pull the body of the annotated tag (strips the PGP signature if any).
+        # Falls back to the tag subject if the body is empty (one-line tag).
+        MSG=$(git for-each-ref --format='%(contents:body)' "refs/tags/${{ github.ref_name }}")
+        if [ -z "$MSG" ]; then
+          MSG=$(git for-each-ref --format='%(contents:subject)' "refs/tags/${{ github.ref_name }}")
+        fi
+        {
+          echo 'text<<STENO_RELEASE_EOF'
+          echo "$MSG"
+          echo 'STENO_RELEASE_EOF'
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Download all build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Prepare release files
+      run: |
+        mkdir -p release
+        find artifacts -name "*.dmg" -exec cp {} release/ \;
+        find artifacts -name "*.zip" -exec cp {} release/ \;
+        # Single-arch release (arm64) as of v0.4.0 — the per-arch
+        # latest-mac.yml from the build job is the published auto-update
+        # manifest as-is.
+        cp artifacts/build-arm64/latest-mac.yml release/latest-mac.yml
+        echo "Published latest-mac.yml:"
+        cat release/latest-mac.yml
+        ls -la release/
+        # Website-friendly alias for the arm64 DMG.
+        cd release
+        for dmg in *.dmg; do
+          if [[ "$dmg" == *"-arm64.dmg" ]]; then
+            cp "$dmg" "stenoAI-macos-arm64.dmg"
+          fi
+        done
+        ls -la
+
+    - name: Create Release with Assets
+      uses: softprops/action-gh-release@v1
+      with:
+        name: StenoAI ${{ github.event.inputs.version || steps.package_version.outputs.version }}
+        body: |
+          ## StenoAI v${{ github.event.inputs.version || steps.package_version.outputs.version }}
+
+          ${{ steps.tag_body.outputs.text }}
+
+          ### Downloads
+
+          - **Apple Silicon (M1-M5)**: `stenoAI-macos-arm64.dmg`
+
+          ### First Time Setup
+          1. Download the DMG
+          2. Install by dragging StenoAI to Applications
+          3. Launch app - setup wizard runs automatically
+          4. Grant microphone permissions when prompted
+          5. Start recording meetings!
+
+          ### Requirements
+          - **Apple Silicon Mac (M1 or later)** — Intel Macs are no longer supported as of v0.4.0
+          - macOS 12 (Monterey) or later
+          - Internet connection for initial setup
+          - Microphone access permissions
+
+          ### Intel Mac users
+          v0.4.0 is **Apple Silicon only**. Intel users should stay on [v0.3.8](https://github.com/ruzin/stenoai/releases/tag/v0.3.8), which is the last release supporting Intel Macs. Auto-update on existing Intel installs is gated and will not push v0.4.0 to those machines.
+        files: |
+          release/*.dmg
+          release/*.zip
+          release/*.yml
+          release/*.yaml
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
